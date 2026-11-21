@@ -1,6 +1,8 @@
 import json
 from unittest.mock import Mock, patch
 
+import requests
+
 from odoo.exceptions import UserError
 from odoo.tests import HttpCase, TransactionCase, tagged
 
@@ -9,6 +11,10 @@ POST = "odoo.addons.delivery_bosta.models.delivery_carrier.requests.post"
 
 def bosta_response(status, body):
     return Mock(ok=status < 400, status_code=status, text=json.dumps(body), json=Mock(return_value=body))
+
+
+def created(tracking_number=48089608):
+    return bosta_response(200, {"success": True, "data": {"_id": "6650f0", "trackingNumber": tracking_number}})
 
 
 class BostaSetup:
@@ -51,11 +57,24 @@ class TestBostaShipping(BostaSetup, TransactionCase):
         self.order.action_confirm()
         self.picking = self.order.picking_ids
 
-    def send(self, body=None, status=200):
-        body = body or {"success": True, "data": {"_id": "6650f0", "trackingNumber": 48089608}}
-        with patch(POST, return_value=bosta_response(status, body)) as post:
-            result = self.carrier.send_shipping(self.picking)
+    def send(self, picking=None, response=None):
+        with patch(POST, return_value=response or created()) as post:
+            result = self.carrier.send_shipping(picking or self.picking)
         return result, post
+
+    def pay_cash_on_delivery(self):
+        provider = self.env["payment.provider"].create(
+            {"name": "Cash on Delivery", "code": "custom", "custom_mode": "cash_on_delivery"}
+        )
+        self.env["payment.transaction"].create({
+            "provider_id": provider.id,
+            "payment_method_id": self.env.ref("payment.payment_method_unknown").id,
+            "reference": "COD-TEST-1",
+            "amount": self.order.amount_total,
+            "currency_id": self.order.currency_id.id,
+            "partner_id": self.partner.id,
+            "sale_order_ids": [(6, 0, self.order.ids)],
+        })
 
     def test_creates_bosta_delivery_and_returns_tracking_number(self):
         result, post = self.send()
@@ -72,31 +91,38 @@ class TestBostaShipping(BostaSetup, TransactionCase):
         self.assertEqual(payload["receiver"], {
             "firstName": "Mona", "lastName": "Adel Hassan", "phone": "+201000000000", "email": "mona@example.com",
         })
-        self.assertEqual(payload["businessReference"], self.order.name)
+        self.assertEqual(payload["businessReference"], f"{self.order.name} {self.picking.name}")
         self.assertTrue(payload["webhookUrl"].endswith("/delivery_bosta/webhook"))
         self.assertEqual(payload["webhookCustomHeaders"], {"Authorization": "hook-secret"})
         self.assertNotIn("cod", payload)
 
+    def test_api_url_can_point_to_another_bosta_environment(self):
+        self.env["ir.config_parameter"].sudo().set_param("delivery_bosta.api_url", "http://bosta-mock:8080/api/v2")
+
+        _result, post = self.send()
+
+        self.assertEqual(post.call_args.args[0], "http://bosta-mock:8080/api/v2/deliveries?apiVersion=1")
+
     def test_collects_order_total_when_paid_cash_on_delivery(self):
-        provider = self.env["payment.provider"].create(
-            {"name": "Cash on Delivery", "code": "custom", "custom_mode": "cash_on_delivery"}
-        )
-        self.env["payment.transaction"].create({
-            "provider_id": provider.id,
-            "payment_method_id": self.env.ref("payment.payment_method_unknown").id,
-            "reference": "COD-TEST-1",
-            "amount": self.order.amount_total,
-            "currency_id": self.order.currency_id.id,
-            "partner_id": self.partner.id,
-            "sale_order_ids": [(6, 0, self.order.ids)],
-        })
+        self.pay_cash_on_delivery()
 
         _result, post = self.send()
 
         self.assertEqual(post.call_args.kwargs["json"]["cod"], self.order.amount_total)
+        self.assertEqual(self.picking.bosta_cod_amount, self.order.amount_total)
+
+    def test_backorder_does_not_collect_cash_twice(self):
+        self.pay_cash_on_delivery()
+        self.send()
+        backorder = self.picking.copy()
+        backorder.sale_id = self.order
+
+        _result, post = self.send(backorder, created(48089609))
+
+        self.assertNotIn("cod", post.call_args.kwargs["json"])
 
     def test_send_to_shipper_stores_tracking_reference_on_transfer(self):
-        with patch(POST, return_value=bosta_response(200, {"success": True, "data": {"trackingNumber": "777"}})):
+        with patch(POST, return_value=created("777")):
             self.picking.send_to_shipper()
 
         self.assertEqual(self.picking.carrier_tracking_ref, "777")
@@ -104,6 +130,14 @@ class TestBostaShipping(BostaSetup, TransactionCase):
             self.carrier.get_tracking_link(self.picking),
             "https://bosta.co/en-eg/tracking-shipments?shipment-number=777",
         )
+
+    def test_several_tracking_numbers_get_one_link_each(self):
+        self.picking.carrier_tracking_ref = "777,888"
+
+        links = json.loads(self.carrier.get_tracking_link(self.picking))
+
+        self.assertEqual([ref for ref, _url in links], ["777", "888"])
+        self.assertTrue(links[1][1].endswith("shipment-number=888"))
 
     def test_incomplete_address_is_refused_before_calling_bosta(self):
         self.partner.write({"street": "12", "phone": False})
@@ -114,7 +148,23 @@ class TestBostaShipping(BostaSetup, TransactionCase):
 
     def test_bosta_error_message_is_shown_to_the_user(self):
         with self.assertRaisesRegex(UserError, r"HTTP 400\): City Not Found"):
-            self.send({"success": False, "message": "City Not Found"}, status=400)
+            self.send(response=bosta_response(400, {"success": False, "message": "City Not Found"}))
+
+    def test_timeout_warns_that_the_delivery_may_exist(self):
+        with patch(POST, side_effect=requests.Timeout()), self.assertRaisesRegex(
+            UserError, f"may still have created the delivery.*{self.picking.name}"
+        ):
+            self.carrier.send_shipping(self.picking)
+        self.assertFalse(self.picking.bosta_cod_amount)
+
+    def test_debug_log_never_contains_credentials(self):
+        with patch.object(type(self.carrier), "log_xml") as log:
+            self.send()
+
+        logged = " ".join(str(call.args[0]) for call in log.call_args_list)
+        self.assertIn("12 Tahrir Street", logged)
+        self.assertNotIn("hook-secret", logged)
+        self.assertNotIn("test-api-key", logged)
 
     def test_missing_api_key_is_refused(self):
         self.carrier.bosta_api_key = False
@@ -144,27 +194,44 @@ class TestBostaWebhook(BostaSetup, HttpCase):
     def post_update(self, body, secret="hook-secret"):
         response = self.url_open(
             "/delivery_bosta/webhook",
-            data=json.dumps(body),
+            data=body if isinstance(body, str) else json.dumps(body),
             headers={"Content-Type": "application/json", "Authorization": secret},
         )
         self.picking.invalidate_recordset()
         return response
 
     def test_status_update_is_recorded_on_the_transfer(self):
-        response = self.post_update({"trackingNumber": 48089608, "state": 45})
+        response = self.post_update({"trackingNumber": 48089608, "state": 45, "timeStamp": 1763700000000})
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok"})
         self.assertEqual(self.picking.bosta_state, "Delivered")
-        self.assertIn("Delivered", self.picking.message_ids.tracking_value_ids.mapped("new_value_char"))
+        self.assertEqual(self.picking.bosta_state_timestamp, 1763700000000)
+        update = self.picking.message_ids.filtered(lambda m: "Delivered" in m.tracking_value_ids.mapped("new_value_char"))
+        self.assertEqual(update.author_id, self.env.ref("base.partner_root"))
 
     def test_repeated_update_adds_no_second_chatter_entry(self):
-        self.post_update({"trackingNumber": "48089608", "state": 24})
+        self.post_update({"trackingNumber": "48089608", "state": 24, "timeStamp": 1000})
         messages = len(self.picking.message_ids)
 
-        self.post_update({"trackingNumber": "48089608", "state": 24})
+        self.post_update({"trackingNumber": "48089608", "state": 24, "timeStamp": 1000})
 
         self.assertEqual(self.picking.bosta_state, "Received at warehouse")
         self.assertEqual(len(self.picking.message_ids), messages)
+
+    def test_older_or_replayed_update_does_not_overwrite_a_newer_one(self):
+        self.post_update({"trackingNumber": "48089608", "state": 45, "timeStamp": 2000})
+
+        response = self.post_update({"trackingNumber": "48089608", "state": 21, "timeStamp": 1000})
+
+        self.assertEqual(response.json(), {"status": "outdated"})
+        self.assertEqual(self.picking.bosta_state, "Delivered")
+
+    def test_transfer_with_several_tracking_numbers_is_found(self):
+        self.picking.carrier_tracking_ref = "111,48089608"
+
+        self.post_update({"trackingNumber": "48089608", "state": 45})
+
+        self.assertEqual(self.picking.bosta_state, "Delivered")
 
     def test_unknown_state_code_is_kept_verbatim(self):
         self.post_update({"trackingNumber": "48089608", "state": 999})
@@ -177,12 +244,31 @@ class TestBostaWebhook(BostaSetup, HttpCase):
         self.assertEqual(response.status_code, 401)
         self.assertFalse(self.picking.bosta_state)
 
+    def test_wrong_secret_does_not_reveal_whether_a_delivery_exists(self):
+        response = self.post_update({"trackingNumber": "123", "state": 45}, secret="guess")
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_one_carrier_secret_cannot_update_another_carriers_delivery(self):
+        self.carrier.copy({"name": "Bosta Alexandria", "bosta_webhook_secret": "other-secret"})
+
+        response = self.post_update({"trackingNumber": "48089608", "state": 45}, secret="other-secret")
+
+        self.assertEqual(response.json(), {"status": "ignored"})
+        self.assertFalse(self.picking.bosta_state)
+
     def test_update_for_unknown_delivery_is_ignored(self):
         response = self.post_update({"trackingNumber": "123", "state": 45})
 
         self.assertEqual(response.json(), {"status": "ignored"})
 
     def test_malformed_body_is_rejected(self):
-        response = self.url_open("/delivery_bosta/webhook", data="not json", headers={"Content-Type": "application/json"})
+        response = self.post_update("not json")
 
         self.assertEqual(response.status_code, 400)
+
+    def test_oversized_body_is_rejected(self):
+        response = self.post_update({"trackingNumber": "48089608", "state": 45, "padding": "x" * 70000})
+
+        self.assertEqual(response.status_code, 413)
+        self.assertFalse(self.picking.bosta_state)

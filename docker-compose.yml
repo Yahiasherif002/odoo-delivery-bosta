@@ -17,3 +17,9 @@ services:
       - ./:/mnt/extra-addons
     ports:
       - "8069:8069"
+  bosta-mock:
+    image: python:3.12-slim
+    profiles: ["demo"]
+    command: python /demo/bosta_mock.py
+    volumes:
+      - ./demo:/demo

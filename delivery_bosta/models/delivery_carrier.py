@@ -1,3 +1,5 @@
+import json
+
 import requests
 
 from odoo import _, fields, models
@@ -5,6 +7,7 @@ from odoo.exceptions import UserError
 
 BOSTA_API_URL = "https://app.bosta.co/api/v2"
 BOSTA_TRACKING_URL = "https://bosta.co/en-eg/tracking-shipments?shipment-number=%s"
+BOSTA_TIMEOUT = 30
 BOSTA_TYPE_DELIVER = 10
 BOSTA_STATES = {
     10: "Pickup requested",
@@ -50,7 +53,10 @@ class DeliveryCarrier(models.Model):
         ]
 
     def bosta_get_tracking_link(self, picking):
-        return BOSTA_TRACKING_URL % picking.carrier_tracking_ref
+        refs = picking.carrier_tracking_ref.split(",")
+        if len(refs) == 1:
+            return BOSTA_TRACKING_URL % refs[0]
+        return json.dumps([[ref, BOSTA_TRACKING_URL % ref] for ref in refs])
 
     def bosta_cancel_shipment(self, pickings):
         raise UserError(_(
@@ -63,14 +69,22 @@ class DeliveryCarrier(models.Model):
         if not api_key:
             raise UserError(_("Set the Bosta API key on the delivery method %s.", self.name))
         payload = self._bosta_delivery_payload(picking)
+        api_url = self.env["ir.config_parameter"].sudo().get_param("delivery_bosta.api_url", BOSTA_API_URL)
         self.log_xml(str({k: v for k, v in payload.items() if k != "webhookCustomHeaders"}), "bosta_request")
         try:
             response = requests.post(
-                f"{BOSTA_API_URL}/deliveries?apiVersion=1",
+                f"{api_url}/deliveries?apiVersion=1",
                 json=payload,
                 headers={"Authorization": api_key},
-                timeout=30,
+                timeout=BOSTA_TIMEOUT,
             )
+        except requests.Timeout as error:
+            raise UserError(_(
+                "Bosta did not answer within %(seconds)s seconds, so it may still have created the delivery. "
+                "Search the Bosta dashboard for reference %(reference)s before sending it again.",
+                seconds=BOSTA_TIMEOUT,
+                reference=payload["businessReference"],
+            )) from error
         except requests.RequestException as error:
             raise UserError(_("Could not reach Bosta: %s", error)) from error
         self.log_xml(response.text, "bosta_response")
@@ -88,6 +102,7 @@ class DeliveryCarrier(models.Model):
         tracking_number = (data.get("data") or data).get("trackingNumber")
         if not tracking_number:
             raise UserError(_("Bosta did not return a tracking number for %s.", picking.name))
+        picking.bosta_cod_amount = payload.get("cod", 0.0)
         return str(tracking_number)
 
     def _bosta_delivery_payload(self, picking):
@@ -127,12 +142,15 @@ class DeliveryCarrier(models.Model):
                 "secondLine": partner.street2 or "",
             },
             "receiver": receiver,
-            "businessReference": order.name or picking.name,
+            "businessReference": f"{order.name} {picking.name}" if order else picking.name,
             "webhookUrl": f"{self.get_base_url()}/delivery_bosta/webhook",
         }
         secret = self.sudo().bosta_webhook_secret
         if secret:
             payload["webhookCustomHeaders"] = {"Authorization": secret}
         if order.transaction_ids.filtered(lambda tx: tx.provider_id.custom_mode == "cash_on_delivery"):
-            payload["cod"] = order.amount_total
+            already_collected = sum((order.picking_ids - picking).mapped("bosta_cod_amount"))
+            remaining = order.currency_id.round(order.amount_total - already_collected)
+            if remaining > 0:
+                payload["cod"] = remaining
         return payload
