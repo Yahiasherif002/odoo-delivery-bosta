@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the module and run its tests on Odoo 19
+        run: |
+          docker compose up -d db
+          docker compose run --rm -T odoo odoo -d test -i delivery_bosta --test-tags /delivery_bosta --stop-after-init 2>&1 | tee test.log
+          grep -E "0 failed, 0 error\(s\) of [1-9][0-9]* tests" test.log
